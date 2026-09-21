@@ -15,6 +15,7 @@ import androidx.compose.ui.unit.sp
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.carequeue.plus.data.model.QueueEntry
 import com.carequeue.plus.ui.components.ActionButton
+import com.carequeue.plus.ui.components.ErrorState
 import com.carequeue.plus.ui.components.InfoCard
 import com.carequeue.plus.ui.components.SectionHeader
 import com.carequeue.plus.ui.components.StatusBadge
@@ -29,6 +30,7 @@ fun QueueManagementScreen(
     queueViewModel: QueueViewModel = viewModel()
 ) {
     val currentQueue by queueViewModel.currentQueue.collectAsState()
+    val queueError by queueViewModel.queueError.collectAsState()
     val waitingEntries by queueViewModel.waitingEntries.collectAsState()
     val uiState by queueViewModel.uiState.collectAsState()
 
@@ -61,12 +63,15 @@ fun QueueManagementScreen(
                 .padding(paddingValues)
                 .padding(16.dp)
         ) {
-            // The last number actually called, not the last number issued.
-            val nowServing = waitingEntries
-                .filter { it.status == QueueEntry.STATUS_CALLED }
-                .maxOfOrNull { it.queueNumber }
-
             currentQueue?.let { queue ->
+                // The number actually being served. Falls back to the value persisted
+                // on the queue so it stays visible after that customer is marked
+                // served and drops out of the live waiting list.
+                val nowServing = waitingEntries
+                    .filter { it.status == QueueEntry.STATUS_CALLED }
+                    .maxOfOrNull { it.queueNumber }
+                    ?: queue.nowServing.takeIf { it > 0 }
+
                 // Queue info
                 Row(
                     modifier = Modifier.fillMaxWidth(),
@@ -160,11 +165,19 @@ fun QueueManagementScreen(
                     }
                 }
             } ?: run {
-                Box(
-                    modifier = Modifier.fillMaxSize(),
-                    contentAlignment = Alignment.Center
-                ) {
-                    CircularProgressIndicator()
+                // Loading, or a failure worth retrying instead of a dead spinner.
+                if (queueError != null) {
+                    ErrorState(
+                        message = queueError!!,
+                        onRetry = { queueViewModel.retryQueue(queueId) }
+                    )
+                } else {
+                    Box(
+                        modifier = Modifier.fillMaxSize(),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        CircularProgressIndicator()
+                    }
                 }
             }
         }

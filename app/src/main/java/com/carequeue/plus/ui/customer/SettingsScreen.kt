@@ -7,11 +7,13 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.carequeue.plus.ui.components.SectionHeader
+import com.carequeue.plus.util.NotificationHelper
 import com.carequeue.plus.viewmodel.AuthViewModel
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -22,7 +24,12 @@ fun SettingsScreen(
     authViewModel: AuthViewModel = viewModel()
 ) {
     val currentUser by authViewModel.currentUser.collectAsState()
-    var notificationsEnabled by remember { mutableStateOf(true) }
+    val context = LocalContext.current
+    // Backed by a persisted preference: this used to be throwaway local state, so
+    // switching it off had no effect and it silently reset to "on" on every visit.
+    var notificationsEnabled by remember {
+        mutableStateOf(NotificationHelper.areNotificationsEnabled(context))
+    }
 
     Scaffold(
         topBar = {
@@ -106,7 +113,10 @@ fun SettingsScreen(
                     }
                     Switch(
                         checked = notificationsEnabled,
-                        onCheckedChange = { notificationsEnabled = it }
+                        onCheckedChange = { enabled ->
+                            notificationsEnabled = enabled
+                            NotificationHelper.setNotificationsEnabled(context, enabled)
+                        }
                     )
                 }
             }

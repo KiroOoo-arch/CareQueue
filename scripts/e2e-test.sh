@@ -132,6 +132,29 @@ fs_field() {
 }
 
 # ------------------------------------------------------------- cleanup ------
+
+# Deletes any entry the customer still holds as WAITING/CALLED.
+# Without this the "Join Queue" button is hidden behind the active entry and the
+# customer half of the run fails, so the script was only re-runnable once.
+reset_customer_active_entries() {
+  local token=$1 uid=$2 ids body count=0
+  body=$(printf '%s' \
+    '{"structuredQuery":{"from":[{"collectionId":"queueEntries"}],"where":{"compositeFilter":{"op":"AND","filters":[' \
+    "{\"fieldFilter\":{\"field\":{\"fieldPath\":\"userId\"},\"op\":\"EQUAL\",\"value\":{\"stringValue\":\"$uid\"}}}," \
+    '{"fieldFilter":{"field":{"fieldPath":"status"},"op":"IN","value":{"arrayValue":{"values":[{"stringValue":"WAITING"},{"stringValue":"CALLED"}]}}}}' \
+    ']}}}}')
+  ids=$(curl -s -X POST "$FIRESTORE:runQuery" \
+    -H "Authorization: Bearer $token" -H "Content-Type: application/json" \
+    -d "$body" \
+    | grep -oE '"name": "[^"]*queueEntries/[^"]*"' | awk -F/ '{print $NF}' | tr -d '"')
+  for id in $ids; do fs_delete "queueEntries/$id"; count=$((count + 1)); done
+  if [[ $count -gt 0 ]]; then
+    ok "cleared $count leftover active entry(ies) for the customer"
+  else
+    ok "customer has no active entry to clear"
+  fi
+}
+
 cleanup_entries() {
   local token=$1
   local ids
@@ -169,10 +192,11 @@ if [[ ${1:-} != "--no-reset" ]]; then
   QID=$(fs_field "$QDOC" queueId); [[ $QID == s9qEvUvHRiE4raeix1jF ]] && ok "queue doc ID == queueId field" || bad "queue ID mismatch ($QID)"
   BID=$(fs_field "businesses/xn2sM877TjLDpKFAJavZ" businessId); [[ $BID == xn2sM877TjLDpKFAJavZ ]] && ok "business doc ID == businessId field" || bad "business ID mismatch ($BID)"
   cleanup_entries "$CUSTOMER_TOKEN"
-  curl -s -X PATCH "$FIRESTORE/$QDOC?updateMask.fieldPaths=currentNumber" \
+  reset_customer_active_entries "$CUSTOMER_TOKEN" "$CUSTOMER_UID"
+  curl -s -X PATCH "$FIRESTORE/$QDOC?updateMask.fieldPaths=currentNumber&updateMask.fieldPaths=nowServing" \
     -H "Authorization: Bearer $CUSTOMER_TOKEN" -H "Content-Type: application/json" \
-    -d '{"fields":{"currentNumber":{"integerValue":"0"}}}' >/dev/null
-  ok "queue currentNumber reset to 0"
+    -d '{"fields":{"currentNumber":{"integerValue":"0"},"nowServing":{"integerValue":"0"}}}' >/dev/null
+  ok "queue currentNumber + nowServing reset to 0"
 fi
 
 # ================================================================= CUSTOMER =

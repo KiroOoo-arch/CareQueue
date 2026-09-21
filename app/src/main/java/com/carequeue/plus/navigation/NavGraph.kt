@@ -111,7 +111,7 @@ fun NavGraph(
                 businessId = businessId,
                 queueId = queueId,
                 onNavigateBack = { navController.popBackStack() },
-                onJoinQueue = { qId, userId ->
+                onNavigateToMyQueue = { qId, userId ->
                     navController.navigate(Screen.MyQueue.createRoute(qId, userId))
                 }
             )
@@ -189,8 +189,10 @@ fun NavGraph(
             arguments = listOf(
                 navArgument("userId") { type = NavType.StringType }
             )
-        ) {
+        ) { backStackEntry ->
+            val adminId = backStackEntry.arguments?.getString("userId") ?: ""
             AnalyticsScreen(
+                adminId = adminId,
                 onNavigateBack = { navController.popBackStack() }
             )
         }

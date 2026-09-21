@@ -4,26 +4,33 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 
+/**
+ * Date formatting helpers.
+ *
+ * [SimpleDateFormat] is *not* thread-safe, so no instance is ever shared: a fresh
+ * formatter is created per call. These are called from both the main thread and
+ * coroutines (e.g. the Firestore listeners), so a cached singleton here would
+ * eventually produce garbled output or throw under concurrent use.
+ */
 object DateUtils {
-    private val displayFormat = SimpleDateFormat("MMM dd, yyyy HH:mm", Locale.getDefault())
-    private val timeFormat = SimpleDateFormat("HH:mm", Locale.getDefault())
-    private val dateFormat = SimpleDateFormat("MMM dd, yyyy", Locale.getDefault())
+    private const val DISPLAY_PATTERN = "MMM dd, yyyy HH:mm"
+    private const val TIME_PATTERN = "HH:mm"
+    private const val DATE_PATTERN = "MMM dd, yyyy"
 
-    fun formatDateTime(timestamp: Long): String {
-        return displayFormat.format(Date(timestamp))
-    }
+    private fun formatter(pattern: String): SimpleDateFormat =
+        SimpleDateFormat(pattern, Locale.getDefault())
 
-    fun formatTime(timestamp: Long): String {
-        return timeFormat.format(Date(timestamp))
-    }
+    fun formatDateTime(timestamp: Long): String =
+        formatter(DISPLAY_PATTERN).format(Date(timestamp))
 
-    fun formatDate(timestamp: Long): String {
-        return dateFormat.format(Date(timestamp))
-    }
+    fun formatTime(timestamp: Long): String =
+        formatter(TIME_PATTERN).format(Date(timestamp))
+
+    fun formatDate(timestamp: Long): String =
+        formatter(DATE_PATTERN).format(Date(timestamp))
 
     fun timeAgo(timestamp: Long): String {
-        val now = System.currentTimeMillis()
-        val diff = now - timestamp
+        val diff = System.currentTimeMillis() - timestamp
         val minutes = diff / (60 * 1000)
         val hours = minutes / 60
         val days = hours / 24

@@ -25,6 +25,7 @@ fun MyQueueScreen(
     queueViewModel: QueueViewModel = viewModel()
 ) {
     val currentQueue by queueViewModel.currentQueue.collectAsState()
+    val queueError by queueViewModel.queueError.collectAsState()
     val userEntry by queueViewModel.userEntry.collectAsState()
     val smartReturn by queueViewModel.smartReturn.collectAsState()
     val uiState by queueViewModel.uiState.collectAsState()
@@ -205,7 +206,7 @@ fun MyQueueScreen(
                 ActionButton(
                     text = if (uiState.isLoading) "Cancelling..." else "Cancel Queue Entry",
                     onClick = {
-                        queueViewModel.cancelEntry(entry.entryId) { success ->
+                        queueViewModel.cancelEntry(entry.entryId, userId) { success ->
                             // Leave the screen only if the entry was really cancelled.
                             if (success) onNavigateBack()
                         }
@@ -215,33 +216,46 @@ fun MyQueueScreen(
                     enabled = !uiState.isLoading
                 )
             } ?: run {
-                // No active entry
-                Box(
-                    modifier = Modifier.fillMaxSize(),
-                    contentAlignment = Alignment.Center
-                ) {
-                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                        Icon(
-                            imageVector = Icons.Default.Queue,
-                            contentDescription = null,
-                            modifier = Modifier.size(64.dp),
-                            tint = MaterialTheme.colorScheme.onSurfaceVariant
-                        )
-                        Spacer(modifier = Modifier.height(16.dp))
-                        Text(
-                            text = "No active queue entry",
-                            fontSize = 18.sp,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant
-                        )
-                        Spacer(modifier = Modifier.height(8.dp))
-                        ActionButton(
-                            text = "Go Back",
-                            onClick = onNavigateBack,
-                            containerColor = MaterialTheme.colorScheme.secondary
-                        )
-                    }
+                // No active entry — or the queue itself could not be loaded, which
+                // is worth saying plainly instead of implying there is no entry.
+                if (queueError != null) {
+                    ErrorState(
+                        message = queueError!!,
+                        onRetry = { queueViewModel.retryQueue(queueId) }
+                    )
+                } else {
+                    NoActiveEntryState(onNavigateBack = onNavigateBack)
                 }
             }
+        }
+    }
+}
+
+@Composable
+private fun NoActiveEntryState(onNavigateBack: () -> Unit) {
+    Box(
+        modifier = Modifier.fillMaxSize(),
+        contentAlignment = Alignment.Center
+    ) {
+        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+            Icon(
+                imageVector = Icons.Default.Queue,
+                contentDescription = null,
+                modifier = Modifier.size(64.dp),
+                tint = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+            Spacer(modifier = Modifier.height(16.dp))
+            Text(
+                text = "No active queue entry",
+                fontSize = 18.sp,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+            Spacer(modifier = Modifier.height(8.dp))
+            ActionButton(
+                text = "Go Back",
+                onClick = onNavigateBack,
+                containerColor = MaterialTheme.colorScheme.secondary
+            )
         }
     }
 }

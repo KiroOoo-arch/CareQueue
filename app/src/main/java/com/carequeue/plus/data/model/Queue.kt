@@ -6,6 +6,12 @@ data class Queue(
     val name: String = "",
     val status: String = STATUS_OPEN,
     val currentNumber: Int = 0,
+    /**
+     * The number currently being served, persisted so "Now Serving" survives a
+     * customer being marked served (the live waiting list no longer contains them).
+     * 0 means nobody has been called yet today.
+     */
+    val nowServing: Int = 0,
     val averageServiceMinutes: Double = 4.0,
     val activeCounters: Int = 1,
     val createdAt: Long = System.currentTimeMillis()

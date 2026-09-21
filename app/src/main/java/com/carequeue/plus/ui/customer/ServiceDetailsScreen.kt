@@ -13,10 +13,10 @@ import androidx.compose.ui.unit.sp
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.carequeue.plus.data.model.QueueEntry
 import com.carequeue.plus.ui.components.ActionButton
+import com.carequeue.plus.ui.components.ErrorState
 import com.carequeue.plus.ui.components.InfoCard
 import com.carequeue.plus.ui.components.QueueNumberDisplay
 import com.carequeue.plus.ui.components.SectionHeader
-import com.carequeue.plus.util.DateUtils
 import com.carequeue.plus.viewmodel.AuthViewModel
 import com.carequeue.plus.viewmodel.QueueViewModel
 
@@ -26,11 +26,12 @@ fun ServiceDetailsScreen(
     businessId: String,
     queueId: String,
     onNavigateBack: () -> Unit,
-    onJoinQueue: (String, String) -> Unit,
+    onNavigateToMyQueue: (String, String) -> Unit,
     authViewModel: AuthViewModel = viewModel(),
     queueViewModel: QueueViewModel = viewModel()
 ) {
     val currentQueue by queueViewModel.currentQueue.collectAsState()
+    val queueError by queueViewModel.queueError.collectAsState()
     val userEntry by queueViewModel.userEntry.collectAsState()
     val smartReturn by queueViewModel.smartReturn.collectAsState()
     val uiState by queueViewModel.uiState.collectAsState()
@@ -72,12 +73,15 @@ fun ServiceDetailsScreen(
                 .padding(16.dp),
             horizontalAlignment = Alignment.CenterHorizontally
         ) {
-            // The last number actually called, not the last number issued.
-            val nowServing = waitingEntries
-                .filter { it.status == QueueEntry.STATUS_CALLED }
-                .maxOfOrNull { it.queueNumber }
-
             currentQueue?.let { queue ->
+                // The number actually being served. Falls back to the value persisted
+                // on the queue so it does not blank out the moment that customer is
+                // marked served and leaves the live waiting list.
+                val nowServing = waitingEntries
+                    .filter { it.status == QueueEntry.STATUS_CALLED }
+                    .maxOfOrNull { it.queueNumber }
+                    ?: queue.nowServing.takeIf { it > 0 }
+
                 // Queue status
                 Text(
                     text = if (queue.isOpen) "Queue Open" else "Queue Closed",
@@ -131,6 +135,20 @@ fun ServiceDetailsScreen(
                             )
                         }
                     }
+
+                    Spacer(modifier = Modifier.height(16.dp))
+
+                    // Holding an entry previously left this screen a dead end: the
+                    // join button is hidden, so there was no way through to the live
+                    // position, SmartReturn estimate or Cancel action.
+                    ActionButton(
+                        text = "View My Queue",
+                        onClick = {
+                            currentUser?.let { user ->
+                                onNavigateToMyQueue(queue.queueId, user.uid)
+                            }
+                        }
+                    )
                 }
 
                 // Join queue button (if no active entry)
@@ -143,7 +161,7 @@ fun ServiceDetailsScreen(
                                 queueViewModel.joinQueue(queue.queueId, user.uid) { success ->
                                     // Navigate to My Queue only when the join succeeded,
                                     // so failures stay visible on this screen.
-                                    if (success) onJoinQueue(queue.queueId, user.uid)
+                                    if (success) onNavigateToMyQueue(queue.queueId, user.uid)
                                 }
                             }
                         },
@@ -161,14 +179,23 @@ fun ServiceDetailsScreen(
                     )
                 }
             } ?: run {
-                // Loading state
-                Box(
-                    modifier = Modifier.fillMaxSize(),
-                    contentAlignment = Alignment.Center
-                ) {
-                    CircularProgressIndicator()
+                // Loading, or a failure that needs to be actionable rather than a
+                // spinner that never resolves.
+                if (queueError != null) {
+                    ErrorState(
+                        message = queueError!!,
+                        onRetry = { queueViewModel.retryQueue(queueId) }
+                    )
+                } else {
+                    Box(
+                        modifier = Modifier.fillMaxSize(),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        CircularProgressIndicator()
+                    }
                 }
             }
         }
     }
 }
+

@@ -8,6 +8,7 @@ import com.carequeue.plus.data.model.Business
 import com.carequeue.plus.data.model.Queue
 import com.carequeue.plus.data.model.QueueEntry
 import com.carequeue.plus.data.repository.QueueRepository
+import com.carequeue.plus.domain.analytics.ServiceSummary
 import com.carequeue.plus.domain.smartereturn.SmartReturn
 import com.carequeue.plus.domain.smartereturn.SmartReturnResult
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -30,6 +31,10 @@ class QueueViewModel : ViewModel() {
     private val _currentQueue = MutableStateFlow<Queue?>(null)
     val currentQueue: StateFlow<Queue?> = _currentQueue
 
+    /** Non-null when the queue could not be loaded, so screens can offer a retry. */
+    private val _queueError = MutableStateFlow<String?>(null)
+    val queueError: StateFlow<String?> = _queueError
+
     private val _userEntry = MutableStateFlow<QueueEntry?>(null)
     val userEntry: StateFlow<QueueEntry?> = _userEntry
 
@@ -41,6 +46,12 @@ class QueueViewModel : ViewModel() {
 
     private val _userHistory = MutableStateFlow<List<QueueEntry>>(emptyList())
     val userHistory: StateFlow<List<QueueEntry>> = _userHistory
+
+    private val _analytics = MutableStateFlow<List<QueueAnalyticsRow>>(emptyList())
+    val analytics: StateFlow<List<QueueAnalyticsRow>> = _analytics
+
+    private val _isLoadingAnalytics = MutableStateFlow(false)
+    val isLoadingAnalytics: StateFlow<Boolean> = _isLoadingAnalytics
 
     private val _errorMessage = MutableStateFlow<String?>(null)
     val errorMessage: StateFlow<String?> = _errorMessage
@@ -74,15 +85,32 @@ class QueueViewModel : ViewModel() {
         )
     }
 
-    fun loadAllQueues() {
+    /** Queues owned by this admin's businesses. */
+    fun loadQueuesForAdmin(adminId: String) {
         viewModelScope.launch {
-            queueRepository.getAllQueues().fold(
+            queueRepository.getQueuesForAdmin(adminId).fold(
                 onSuccess = { _queues.value = it },
                 onFailure = { e ->
-                    Log.e("QueueViewModel", "Failed to load all queues: ${e.message}", e)
+                    Log.e("QueueViewModel", "Failed to load admin queues: ${e.message}", e)
                     _errorMessage.value = "Failed to load queues: ${e.message}"
                 }
             )
+        }
+    }
+
+    /** Statistics for each of this admin's queues, computed from real entry history. */
+    fun loadAnalytics(adminId: String) {
+        viewModelScope.launch {
+            _isLoadingAnalytics.value = true
+            val queues = queueRepository.getQueuesForAdmin(adminId).getOrElse { emptyList() }
+            _analytics.value = queues.map { queue ->
+                QueueAnalyticsRow(
+                    queue = queue,
+                    summary = queueRepository.getQueueStats(queue.queueId)
+                        .getOrElse { ServiceSummary() }
+                )
+            }
+            _isLoadingAnalytics.value = false
         }
     }
 
@@ -90,18 +118,43 @@ class QueueViewModel : ViewModel() {
         viewModelScope.launch {
             val queue = queueRepository.getQueue(queueId)
             _currentQueue.value = queue
+            if (queue == null) {
+                _queueError.value = "This service is unavailable. It may have been removed."
+            } else {
+                _queueError.value = null
+            }
         }
     }
 
     fun observeQueue(queueId: String) {
         viewModelScope.launch {
-            queueRepository.observeQueue(queueId).collect { queue ->
-                _currentQueue.value = queue
-                if (_userEntry.value != null && queue != null) {
-                    updateSmartReturn(queue, _userEntry.value!!)
-                }
+            queueRepository.observeQueue(queueId).collect { result ->
+                result.fold(
+                    onSuccess = { queue ->
+                        _currentQueue.value = queue
+                        // A missing document is a real, reportable state — not
+                        // "still loading" — otherwise the screen spins forever.
+                        _queueError.value =
+                            if (queue == null) "This service is unavailable. It may have been removed."
+                            else null
+                        if (queue != null && _userEntry.value != null) {
+                            updateSmartReturn(queue, _userEntry.value!!)
+                        }
+                    },
+                    onFailure = { e ->
+                        Log.e("QueueViewModel", "Queue listener failed: ${e.message}", e)
+                        _queueError.value = "Lost connection to this queue. Check your network."
+                    }
+                )
             }
         }
+    }
+
+    /** Re-attempts loading after a listener or fetch failure. */
+    fun retryQueue(queueId: String) {
+        _queueError.value = null
+        loadQueue(queueId)
+        observeQueue(queueId)
     }
 
     fun observeUserEntry(queueId: String, userId: String) {
@@ -178,19 +231,27 @@ class QueueViewModel : ViewModel() {
 
     fun markServed(entryId: String) {
         viewModelScope.launch {
-            queueRepository.markServed(entryId)
+            queueRepository.markServed(entryId).onFailure { e ->
+                Log.e("QueueViewModel", "Failed to mark served: ${e.message}", e)
+                _uiState.value = _uiState.value.copy(
+                    error = e.message ?: "Failed to mark customer served"
+                )
+            }
         }
     }
 
     fun skipEntry(entryId: String) {
         viewModelScope.launch {
-            queueRepository.skipEntry(entryId)
+            queueRepository.skipEntry(entryId).onFailure { e ->
+                Log.e("QueueViewModel", "Failed to skip entry: ${e.message}", e)
+                _uiState.value = _uiState.value.copy(error = e.message ?: "Failed to skip customer")
+            }
         }
     }
 
-    fun cancelEntry(entryId: String, onResult: (Boolean) -> Unit = {}) {
+    fun cancelEntry(entryId: String, userId: String, onResult: (Boolean) -> Unit = {}) {
         viewModelScope.launch {
-            queueRepository.cancelEntry(entryId).fold(
+            queueRepository.cancelEntry(entryId, userId).fold(
                 onSuccess = {
                     _userEntry.value = null
                     _smartReturn.value = null
@@ -214,16 +275,17 @@ class QueueViewModel : ViewModel() {
 
     fun toggleQueueStatus(queueId: String, currentIsOpen: Boolean) {
         viewModelScope.launch {
-            val newStatus = if (currentIsOpen) {
-                Queue.STATUS_CLOSED
-            } else {
-                Queue.STATUS_OPEN
-            }
+            val isOpening = !currentIsOpen
+            val newStatus = if (currentIsOpen) Queue.STATUS_CLOSED else Queue.STATUS_OPEN
             try {
+                val updates = mutableMapOf<String, Any>("status" to newStatus)
+                // Reopening starts a fresh serving session, so the persisted
+                // "Now Serving" from the previous session must not linger.
+                if (isOpening) updates["nowServing"] = 0
                 FirebaseConfig.db
                     .collection(FirebaseConfig.QUEUES)
                     .document(queueId)
-                    .update("status", newStatus)
+                    .update(updates)
                     .await()
             } catch (e: Exception) {
                 Log.e("QueueViewModel", "Failed to update queue status: ${e.message}", e)
@@ -245,4 +307,9 @@ class QueueViewModel : ViewModel() {
 data class QueueUiState(
     val isLoading: Boolean = false,
     val error: String? = null
+)
+
+data class QueueAnalyticsRow(
+    val queue: Queue,
+    val summary: ServiceSummary
 )

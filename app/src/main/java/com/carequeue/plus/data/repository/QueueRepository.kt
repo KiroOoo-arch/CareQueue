@@ -5,7 +5,11 @@ import com.carequeue.plus.data.firebase.FirebaseConfig
 import com.carequeue.plus.data.model.Business
 import com.carequeue.plus.data.model.Queue
 import com.carequeue.plus.data.model.QueueEntry
+import com.carequeue.plus.domain.analytics.QueueAnalytics
+import com.carequeue.plus.domain.analytics.ServiceSummary
 import com.carequeue.plus.domain.queue.QueueRules
+import com.carequeue.plus.domain.smartereturn.SmartReturn
+import com.google.firebase.firestore.DocumentSnapshot
 import kotlinx.coroutines.channels.awaitClose
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.callbackFlow
@@ -16,15 +20,22 @@ class QueueRepository {
     private val queuesRef = FirebaseConfig.db.collection(FirebaseConfig.QUEUES)
     private val entriesRef = FirebaseConfig.db.collection(FirebaseConfig.QUEUE_ENTRIES)
 
+    /** Thrown when another admin claimed the entry between our query and our write. */
+    private class EntryClaimedException : Exception("Entry already claimed")
+
     /**
      * Snapshot to QueueEntry, tolerating timestamp-shaped fields.
      * Firestore's default mapper crashes the listener (main thread) if any
      * document carries a Timestamp where a Long is expected — e.g. data
      * written by the Firebase Console or another client. Parsing manually
      * keeps one bad field from taking down the whole app.
+     *
+     * Accepts a plain [DocumentSnapshot] so the same parser serves queries,
+     * listeners and transactions.
      */
-    private fun parseEntry(doc: com.google.firebase.firestore.QueryDocumentSnapshot): QueueEntry? =
-        try {
+    private fun parseEntry(doc: DocumentSnapshot?): QueueEntry? {
+        if (doc == null || !doc.exists()) return null
+        return try {
             fun epoch(field: String): Long? = when (val v = doc.get(field)) {
                 null -> null
                 is com.google.firebase.Timestamp -> v.toDate().time
@@ -35,7 +46,9 @@ class QueueRepository {
                 entryId = doc.id,
                 queueId = doc.getString("queueId") ?: "",
                 userId = doc.getString("userId") ?: "",
-                queueNumber = (doc.getLong("queueNumber") ?: doc.get("queueNumber")?.let { (it as? Number)?.toLong() } ?: 0L).toInt(),
+                queueNumber = (doc.getLong("queueNumber")
+                    ?: (doc.get("queueNumber") as? Number)?.toLong()
+                    ?: 0L).toInt(),
                 status = doc.getString("status") ?: QueueEntry.STATUS_WAITING,
                 joinedAt = epoch("joinedAt") ?: System.currentTimeMillis(),
                 calledAt = epoch("calledAt"),
@@ -47,6 +60,7 @@ class QueueRepository {
             Log.e("QueueRepository", "Skipping unparsable entry ${doc.id}: ${e.message}")
             null
         }
+    }
 
     // Business operations
     suspend fun getActiveBusinesses(): Result<List<Business>> {
@@ -54,7 +68,10 @@ class QueueRepository {
             Log.d("QueueRepository", "Fetching all businesses from Firestore...")
             val snapshot = businessesRef.get().await()
             Log.d("QueueRepository", "Got ${snapshot.size()} documents from businesses collection")
-            val businesses = snapshot.toObjects(Business::class.java)
+            // The document ID is authoritative, matching getQueuesForBusiness.
+            val businesses = snapshot.documents.mapNotNull { doc ->
+                doc.toObject(Business::class.java)?.copy(businessId = doc.id)
+            }
             businesses.forEach { b ->
                 Log.d("QueueRepository", "  Business: ${b.name} (${b.businessId}) category=${b.category} isOpen=${b.isOpen}")
             }
@@ -110,14 +127,20 @@ class QueueRepository {
         }
     }
 
-    fun observeQueue(queueId: String): Flow<Queue?> = callbackFlow {
+    /**
+     * Emits [Result.success] with the queue (or null when the document is gone),
+     * and [Result.failure] when the listener itself errors. Surfacing the
+     * difference matters: a failed listener used to look identical to "still
+     * loading", leaving the screen on a spinner forever.
+     */
+    fun observeQueue(queueId: String): Flow<Result<Queue?>> = callbackFlow {
         val listener = queuesRef.document(queueId).addSnapshotListener { snapshot, error ->
             if (error != null) {
-                trySend(null)
+                trySend(Result.failure(error))
                 return@addSnapshotListener
             }
             // Keep the document ID authoritative, matching getQueuesForBusiness.
-            trySend(snapshot?.toObject(Queue::class.java)?.copy(queueId = snapshot.id))
+            trySend(Result.success(snapshot?.toObject(Queue::class.java)?.copy(queueId = snapshot.id)))
         }
         awaitClose { listener.remove() }
     }
@@ -164,8 +187,74 @@ class QueueRepository {
                 newEntry
             }.await()
 
+            // Snapshot the SmartReturn estimate onto the entry so the recommendation
+            // survives the app being closed. The live value is still recomputed on
+            // screen; these fields were previously parsed but never written.
+            persistSmartReturn(entry)
+
             Result.success(entry)
         } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    /** Best-effort: a failed snapshot write must never fail a successful join. */
+    private suspend fun persistSmartReturn(entry: QueueEntry) {
+        try {
+            val queue = getQueue(entry.queueId) ?: return
+            val peopleAhead = getPeopleAhead(entry.queueId, entry.queueNumber)
+            val estimate = SmartReturn.calculateSmartReturn(peopleAhead, queue)
+            entriesRef.document(entry.entryId).update(
+                mapOf(
+                    "estimatedWaitMinutes" to estimate.estimatedWaitMinutes,
+                    "recommendedReturnAt" to estimate.recommendedReturnAt
+                )
+            ).await()
+        } catch (e: Exception) {
+            Log.w("QueueRepository", "Could not persist SmartReturn for ${entry.entryId}: ${e.message}")
+        }
+    }
+
+    /**
+     * Queues belonging to the businesses this admin created, so one admin cannot see
+     * (or manage) another business's line. Businesses without a matching owner are
+     * simply not shown to anybody.
+     */
+    suspend fun getQueuesForAdmin(adminId: String): Result<List<Queue>> {
+        return try {
+            val ownedBusinessIds = businessesRef
+                .whereEqualTo("createdBy", adminId)
+                .get()
+                .await()
+                .documents
+                .map { it.id }
+
+            if (ownedBusinessIds.isEmpty()) {
+                return Result.success(emptyList())
+            }
+
+            val queues = queuesRef
+                .whereIn("businessId", ownedBusinessIds)
+                .get()
+                .await()
+                .documents
+                .map { doc -> (doc.toObject(Queue::class.java) ?: Queue()).copy(queueId = doc.id) }
+
+            Result.success(queues)
+        } catch (e: Exception) {
+            Log.e("QueueRepository", "ERROR fetching queues for admin $adminId: ${e.message}", e)
+            Result.failure(e)
+        }
+    }
+
+    /** Real service statistics computed from this queue's entry history. */
+    suspend fun getQueueStats(queueId: String): Result<ServiceSummary> {
+        return try {
+            // Equality-only query (no composite index required).
+            val snapshot = entriesRef.whereEqualTo("queueId", queueId).get().await()
+            Result.success(QueueAnalytics.summarize(snapshot.documents.mapNotNull(::parseEntry)))
+        } catch (e: Exception) {
+            Log.e("QueueRepository", "ERROR computing stats for $queueId: ${e.message}", e)
             Result.failure(e)
         }
     }
@@ -178,9 +267,7 @@ class QueueRepository {
                 .whereIn("status", listOf(QueueEntry.STATUS_WAITING, QueueEntry.STATUS_CALLED))
                 .get()
                 .await()
-            snapshot.documents
-                .firstOrNull()
-                ?.let { (it as? com.google.firebase.firestore.QueryDocumentSnapshot)?.let(::parseEntry) }
+            snapshot.documents.firstNotNullOfOrNull(::parseEntry)
         } catch (e: Exception) {
             Log.e(
                 "QueueRepository",
@@ -198,14 +285,11 @@ class QueueRepository {
             .whereIn("status", listOf(QueueEntry.STATUS_WAITING, QueueEntry.STATUS_CALLED))
             .addSnapshotListener { snapshot, error ->
                 if (error != null) {
+                    Log.e("QueueRepository", "Active-entry listener failed: ${error.message}", error)
                     trySend(null)
                     return@addSnapshotListener
                 }
-                trySend(
-                    snapshot?.documents
-                        ?.mapNotNull { (it as? com.google.firebase.firestore.QueryDocumentSnapshot)?.let(::parseEntry) }
-                        ?.firstOrNull()
-                )
+                trySend(snapshot?.documents?.firstNotNullOfOrNull(::parseEntry))
             }
         awaitClose { listener.remove() }
     }
@@ -216,11 +300,12 @@ class QueueRepository {
             .whereEqualTo("queueId", queueId)
             .addSnapshotListener { snapshot, error ->
                 if (error != null) {
+                    Log.e("QueueRepository", "Waiting-list listener failed: ${error.message}", error)
                     trySend(emptyList())
                     return@addSnapshotListener
                 }
                 val entries = snapshot?.documents
-                    ?.mapNotNull { (it as? com.google.firebase.firestore.QueryDocumentSnapshot)?.let(::parseEntry) }
+                    ?.mapNotNull(::parseEntry)
                     ?.filter { it.status == QueueEntry.STATUS_WAITING || it.status == QueueEntry.STATUS_CALLED }
                     ?.sortedBy { it.queueNumber }
                     ?: emptyList()
@@ -229,65 +314,125 @@ class QueueRepository {
         awaitClose { listener.remove() }
     }
 
+    /**
+     * Calls the earliest waiting customer.
+     *
+     * The candidate is picked by a query (transactions cannot query), then claimed
+     * with a compare-and-set inside a transaction: if another admin called the same
+     * entry in the meantime the write is discarded and we re-query. Without this,
+     * two admins tapping "Call Next" at the same moment would both mark the same
+     * customer CALLED and silently skip nobody.
+     */
     suspend fun callNext(queueId: String): Result<QueueEntry?> {
         return try {
-            val queue = getQueue(queueId) ?: return Result.failure(Exception("Queue not found"))
-            // Single-equality query (no composite index required); the selection
-            // rule lives in QueueRules.nextEntryToCall.
-            val snapshot = entriesRef
-                .whereEqualTo("queueId", queueId)
-                .get()
-                .await()
-            val nextEntry = QueueRules.nextEntryToCall(
-                snapshot.documents.mapNotNull { (it as? com.google.firebase.firestore.QueryDocumentSnapshot)?.let(::parseEntry) }
-            )
+            repeat(CALL_NEXT_ATTEMPTS) {
+                val queue = getQueue(queueId)
+                    ?: return Result.failure(Exception("Queue not found"))
 
-            if (nextEntry == null) {
-                return Result.success(null)
+                val snapshot = entriesRef.whereEqualTo("queueId", queueId).get().await()
+                val candidate = QueueRules.nextEntryToCall(snapshot.documents.mapNotNull(::parseEntry))
+                    ?: return Result.success(null)
+
+                val claimed: QueueEntry? = try {
+                    FirebaseConfig.db.runTransaction { transaction ->
+                        val ref = entriesRef.document(candidate.entryId)
+                        val current = parseEntry(transaction.get(ref))
+                            ?: throw EntryClaimedException()
+                        if (current.status != QueueEntry.STATUS_WAITING) {
+                            throw EntryClaimedException()
+                        }
+                        val updated = QueueRules.applyTransition(
+                            current,
+                            QueueEntry.STATUS_CALLED,
+                            System.currentTimeMillis()
+                        )
+                        transaction.set(ref, updated)
+                        // Persist who is being served so the customer-facing screen
+                        // keeps showing #N after that entry leaves the waiting list.
+                        transaction.update(
+                            queuesRef.document(queueId),
+                            "nowServing",
+                            updated.queueNumber
+                        )
+                        updated
+                    }.await()
+                } catch (e: EntryClaimedException) {
+                    Log.d("QueueRepository", "Entry ${candidate.entryId} taken; retrying")
+                    null
+                }
+
+                if (claimed != null) return Result.success(claimed)
             }
-
-            // Update entry status to CALLED via the shared transition rules
-            val updatedEntry = QueueRules.applyTransition(
-                nextEntry,
-                QueueEntry.STATUS_CALLED,
-                System.currentTimeMillis()
-            )
-            entriesRef.document(nextEntry.entryId).set(updatedEntry).await()
-
-            Result.success(updatedEntry)
+            Result.failure(Exception("Could not call the next customer. Please try again."))
         } catch (e: Exception) {
             Result.failure(e)
         }
     }
 
-    suspend fun markServed(entryId: String): Result<Unit> {
+    /**
+     * Writes [newStatus] for one entry, validating against [QueueRules] and doing the
+     * read-modify-write inside a transaction. Going through the shared state machine
+     * means the tested transition rules are the same ones production enforces.
+     */
+    private suspend fun transitionEntry(entryId: String, newStatus: String): Result<QueueEntry> {
         return try {
-            entriesRef.document(entryId).update(
-                mapOf(
-                    "status" to QueueEntry.STATUS_SERVED,
-                    "servedAt" to System.currentTimeMillis()
+            val updated = FirebaseConfig.db.runTransaction { transaction ->
+                val ref = entriesRef.document(entryId)
+                val entry = parseEntry(transaction.get(ref))
+                    ?: throw Exception("Queue entry not found")
+
+                // Repeated taps (or a stale list) must not surface as an error.
+                if (entry.status == newStatus) return@runTransaction entry
+
+                val next = QueueRules.applyTransition(entry, newStatus, System.currentTimeMillis())
+                transaction.set(ref, next)
+                next
+            }.await()
+            Result.success(updated)
+        } catch (e: Exception) {
+            Log.e("QueueRepository", "ERROR transitioning $entryId -> $newStatus: ${e.message}", e)
+            Result.failure(e)
+        }
+    }
+
+    suspend fun markServed(entryId: String): Result<QueueEntry> =
+        transitionEntry(entryId, QueueEntry.STATUS_SERVED)
+
+    suspend fun skipEntry(entryId: String): Result<QueueEntry> =
+        transitionEntry(entryId, QueueEntry.STATUS_SKIPPED)
+
+    /**
+     * Cancels the caller's own entry.
+     *
+     * [userId] is verified against the stored document: without it any signed-in
+     * user could cancel (or skip) somebody else's place in the line just by
+     * knowing an entry ID.
+     */
+    suspend fun cancelEntry(entryId: String, userId: String): Result<QueueEntry> {
+        return try {
+            val result = FirebaseConfig.db.runTransaction { transaction ->
+                val ref = entriesRef.document(entryId)
+                val entry = parseEntry(transaction.get(ref))
+                    ?: throw Exception("Queue entry not found")
+
+                if (entry.userId != userId) {
+                    throw Exception("You can only cancel your own queue entry")
+                }
+                if (entry.status == QueueEntry.STATUS_CANCELLED) {
+                    return@runTransaction entry
+                }
+
+                val next = QueueRules.applyTransition(
+                    entry,
+                    QueueEntry.STATUS_CANCELLED,
+                    System.currentTimeMillis()
                 )
-            ).await()
-            Result.success(Unit)
+                transaction.set(ref, next)
+                next
+            }.await()
+            Result.success(result)
         } catch (e: Exception) {
-            Result.failure(e)
-        }
-    }
-
-    suspend fun skipEntry(entryId: String): Result<Unit> {
-        return try {
-            entriesRef.document(entryId).update("status", QueueEntry.STATUS_SKIPPED).await()
-            Result.success(Unit)
-        } catch (e: Exception) {
-            Result.failure(e)
-        }
-    }
-
-    suspend fun cancelEntry(entryId: String): Result<Unit> {
-        return try {
-            entriesRef.document(entryId).update("status", QueueEntry.STATUS_CANCELLED).await()
-            Result.success(Unit)
-        } catch (e: Exception) {
+            Log.e("QueueRepository", "ERROR cancelling $entryId: ${e.message}", e)
             Result.failure(e)
         }
     }
@@ -300,11 +445,9 @@ class QueueRepository {
                 .get()
                 .await()
             snapshot.documents
-                .mapNotNull { (it as? com.google.firebase.firestore.QueryDocumentSnapshot)?.let(::parseEntry) }
+                .mapNotNull(::parseEntry)
                 .count {
-                    it != null &&
-                        (it.status == QueueEntry.STATUS_WAITING || it.status == QueueEntry.STATUS_CALLED) &&
-                        it.queueNumber < queueNumber
+                    it.isActive && it.queueNumber < queueNumber
                 }
         } catch (e: Exception) {
             Log.e(
@@ -331,7 +474,7 @@ class QueueRepository {
                 .get()
                 .await()
             snapshot.documents
-                .mapNotNull { (it as? com.google.firebase.firestore.QueryDocumentSnapshot)?.let(::parseEntry) }
+                .mapNotNull(::parseEntry)
                 // Sort client-side by the most relevant timestamp: docs whose
                 // servedAt is null (skipped/cancelled) would be dropped by a
                 // server-side orderBy("servedAt").
@@ -340,5 +483,10 @@ class QueueRepository {
             Log.e("QueueRepository", "ERROR fetching history for $userId: ${e.message}", e)
             emptyList()
         }
+    }
+
+    private companion object {
+        /** How many times callNext re-queries after losing a race for an entry. */
+        const val CALL_NEXT_ATTEMPTS = 3
     }
 }

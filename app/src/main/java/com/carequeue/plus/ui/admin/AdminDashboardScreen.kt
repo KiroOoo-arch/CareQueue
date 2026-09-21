@@ -33,9 +33,8 @@ fun AdminDashboardScreen(
     val currentUser by authViewModel.currentUser.collectAsState()
 
     LaunchedEffect(currentUser?.uid) {
-        // Load all queues for the dashboard.
-        // TODO: scope to the admin's own business (Business.createdBy) instead of all queues.
-        queueViewModel.loadAllQueues()
+        // Scoped to the admin's own businesses so admins cannot see each other's queues.
+        currentUser?.uid?.let { queueViewModel.loadQueuesForAdmin(it) }
     }
 
     Scaffold(
@@ -121,7 +120,14 @@ fun AdminDashboardScreen(
                         )
                         Spacer(modifier = Modifier.height(16.dp))
                         Text(
-                            text = "No queues available",
+                            text = "No queues assigned to you",
+                            fontWeight = FontWeight.Medium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                        Spacer(modifier = Modifier.height(4.dp))
+                        Text(
+                            text = "Queues appear here once their business's createdBy is your user ID.",
+                            fontSize = 13.sp,
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
                     }

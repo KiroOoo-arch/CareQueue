@@ -1,0 +1,21 @@
+*.iml
+.gradle
+.kotlin
+.freebuff
+/local.properties
+/.idea/
+.DS_Store
+/build
+/captures
+.externalNativeBuild
+.cxx
+local.properties
+
+# Signing material — never commit
+*.jks
+*.keystore
+keystore.properties
+
+# E2E test artifacts (generated)
+e2e-artifacts/
+e2e-test-preview.html

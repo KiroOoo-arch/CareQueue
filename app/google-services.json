@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "51337542279",
+    "project_id": "carequeue-dbfeb",
+    "storage_bucket": "carequeue-dbfeb.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:51337542279:android:a01ac486169af858251622",
+        "android_client_info": {
+          "package_name": "com.carequeue.plus"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyAtaM571K12iRKb_nyDzdWJplWArqnsx4o"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

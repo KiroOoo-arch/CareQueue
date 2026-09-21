@@ -1,0 +1,12 @@
+* text=auto
+
+# Shell scripts must keep LF endings or they fail to run on Linux/macOS/CI
+*.sh text eol=lf
+gradlew text eol=lf
+*.bat text eol=crlf
+
+*.jar binary
+*.apk binary
+*.webp binary
+*.png binary
+*.ttf binary
